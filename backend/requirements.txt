@@ -1,5 +1,5 @@
 fastapi==0.110.0
 uvicorn[standard]==0.27.1
 pyrogram==2.0.106
-tgcrypto==1.2.6
+tgcrypto==1.2.5
 python-dotenv==1.0.1
