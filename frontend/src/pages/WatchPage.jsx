@@ -105,7 +105,6 @@ export default function WatchPage() {
                 <video
                     ref={videoRef}
                     className="w-full aspect-video"
-                    crossOrigin="anonymous"
                     playsInline
                 >
                     <source src={streamUrl} type="video/mp4" />
