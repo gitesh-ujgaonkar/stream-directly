@@ -57,19 +57,14 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS — allow the Vercel frontend (and localhost for dev)
-origins = [
-    FRONTEND_URL,
-    "http://localhost:5173",
-    "http://localhost:3000",
-]
-
+# CORS — allow all origins (safe for a public video streaming API)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Length", "Content-Range", "Accept-Ranges"],
 )
 
 
