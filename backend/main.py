@@ -1,19 +1,24 @@
 """
 FastAPI application — streams Telegram media to the web via an async pipe.
-No files are saved to disk; everything flows through memory.
+Optimized for Render's 512MB free tier: chunked downloads, aggressive GC,
+inactivity killer, and RAM-gated stream admission.
 """
 
 import asyncio
+import gc
 import time
 import logging
-from io import BytesIO
 from contextlib import asynccontextmanager
 
+import psutil
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 
-from config import API_ID, API_HASH, BOT_TOKEN, FRONTEND_URL, CHUNK_SIZE, IDLE_TIMEOUT, PORT
+from config import (
+    CHUNK_SIZE, IDLE_TIMEOUT, PORT,
+    MAX_CONCURRENT_STREAMS, RAM_LIMIT_PERCENT,
+)
 from bot import bot
 
 # ---------------------------------------------------------------------------
@@ -23,10 +28,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("tg-stream")
 
 # ---------------------------------------------------------------------------
-# Pyrogram user-bot client (shares credentials with bot but runs as a
-# separate client so streaming and bot commands don't block each other)
+# Pyrogram client (reuse the bot client)
 # ---------------------------------------------------------------------------
-stream_client = bot  # reuse the same bot client for simplicity
+stream_client = bot
 
 # ---------------------------------------------------------------------------
 # Activity tracker — per-stream last-access timestamps
@@ -35,16 +39,44 @@ active_streams: dict[str, float] = {}
 
 
 # ---------------------------------------------------------------------------
+# Memory helpers
+# ---------------------------------------------------------------------------
+def get_ram_usage() -> dict:
+    """Return current process RAM stats."""
+    proc = psutil.Process()
+    mem = proc.memory_info()
+    sys_mem = psutil.virtual_memory()
+    return {
+        "rss_mb": round(mem.rss / (1024 * 1024), 1),
+        "percent": sys_mem.percent,
+        "available_mb": round(sys_mem.available / (1024 * 1024), 1),
+    }
+
+
+def is_ram_ok() -> bool:
+    """Check if RAM usage is below the safety threshold."""
+    return psutil.virtual_memory().percent < RAM_LIMIT_PERCENT
+
+
+def force_gc():
+    """Force garbage collection and log freed objects."""
+    collected = gc.collect()
+    logger.info(f"🧹 GC collected {collected} objects — RAM: {get_ram_usage()['rss_mb']} MB")
+
+
+# ---------------------------------------------------------------------------
 # Lifespan — start / stop the Pyrogram client with FastAPI
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    gc.enable()
     logger.info("🚀 Starting Pyrogram client …")
     await stream_client.start()
-    logger.info("✅ Pyrogram client ready")
+    logger.info(f"✅ Pyrogram client ready — RAM: {get_ram_usage()['rss_mb']} MB")
     yield
     logger.info("🛑 Stopping Pyrogram client …")
     await stream_client.stop()
+    force_gc()
     logger.info("👋 Pyrogram client stopped")
 
 
@@ -53,7 +85,7 @@ async def lifespan(app: FastAPI):
 # ---------------------------------------------------------------------------
 app = FastAPI(
     title="Telegram Stream API",
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -69,34 +101,63 @@ app.add_middleware(
 
 
 # ---------------------------------------------------------------------------
-# Health check
+# Health check (includes RAM stats)
 # ---------------------------------------------------------------------------
 @app.get("/health")
 async def health():
-    return {"status": "ok", "uptime": time.strftime("%H:%M:%S")}
+    ram = get_ram_usage()
+    return {
+        "status": "ok",
+        "ram": ram,
+        "active_streams": len(active_streams),
+        "ram_ok": is_ram_ok(),
+    }
 
 
 # ---------------------------------------------------------------------------
-# Stream endpoint
+# Stream endpoint — with memory-safe chunked pipe
 # ---------------------------------------------------------------------------
 @app.get("/stream/{file_id}")
 async def stream_video(file_id: str):
     """
-    Download the Telegram file identified by *file_id* into memory and
-    stream it back to the client as chunked video/mp4.
+    Stream a Telegram file to the browser.
 
-    An **activity monitor** closes the generator if no chunk is consumed
-    for IDLE_TIMEOUT seconds (saves server resources on abandoned tabs).
+    Memory protections:
+    - Admission gate: refuses if RAM > 80% or too many concurrent streams
+    - Downloads into memory in one shot (Pyrogram limitation), BUT uses
+      small chunk yields (256KB) and immediately frees the buffer after use
+    - 30-second inactivity killer
+    - gc.collect() on stream end
     """
+
+    # ── Admission gate ──
+    if not is_ram_ok():
+        ram = get_ram_usage()
+        logger.warning(f"🚫 Stream refused — RAM at {ram['percent']}%")
+        raise HTTPException(
+            status_code=503,
+            detail=f"Server memory too high ({ram['percent']}%). Try again in a minute.",
+        )
+
+    if len(active_streams) >= MAX_CONCURRENT_STREAMS:
+        logger.warning(f"🚫 Stream refused — {len(active_streams)} active (max {MAX_CONCURRENT_STREAMS})")
+        raise HTTPException(
+            status_code=503,
+            detail=f"Server busy ({len(active_streams)} active streams). Try again shortly.",
+        )
 
     stream_key = file_id
 
     async def generate():
+        buffer = None
         try:
-            logger.info(f"⬇️  Starting download for {file_id[:20]}…")
+            logger.info(f"⬇️  Starting download for {file_id[:20]}… | RAM: {get_ram_usage()['rss_mb']} MB")
             active_streams[stream_key] = time.time()
 
-            # Download entire file into a BytesIO buffer (in-memory)
+            # Download entire file into memory (Pyrogram doesn't support
+            # partial/chunked downloads natively for bots).
+            # We minimise damage by streaming it out in tiny chunks and
+            # freeing the buffer ASAP.
             media = await stream_client.download_media(
                 file_id,
                 in_memory=True,
@@ -106,42 +167,65 @@ async def stream_video(file_id: str):
                 logger.warning(f"❌ download_media returned None for {file_id[:20]}")
                 return
 
-            # media is a BytesIO object — seek to start
-            if isinstance(media, BytesIO):
-                buffer = media
+            # Normalise to bytes — avoid keeping both BytesIO + bytes alive
+            if hasattr(media, 'getvalue'):
+                raw_bytes = media.getvalue()
+                media.close()
+                del media
+            elif isinstance(media, (bytes, bytearray)):
+                raw_bytes = bytes(media)
+                del media
             else:
-                buffer = BytesIO(media)
+                raw_bytes = bytes(media)
+                del media
 
-            buffer.seek(0)
-            total = buffer.getbuffer().nbytes
+            total = len(raw_bytes)
             sent = 0
 
-            logger.info(f"📦 File ready — {total / (1024*1024):.1f} MB, streaming …")
+            logger.info(f"📦 File ready — {total / (1024*1024):.1f} MB | RAM: {get_ram_usage()['rss_mb']} MB")
 
-            while True:
-                # ---- activity monitor ----
+            offset = 0
+            while offset < total:
+                # ── Inactivity killer ──
                 elapsed = time.time() - active_streams.get(stream_key, time.time())
                 if elapsed > IDLE_TIMEOUT:
-                    logger.info(f"⏰ Idle timeout ({IDLE_TIMEOUT}s) — closing stream {file_id[:20]}")
+                    logger.info(f"⏰ Idle timeout ({IDLE_TIMEOUT}s) — killing stream {file_id[:20]}")
                     break
 
-                chunk = buffer.read(CHUNK_SIZE)
-                if not chunk:
-                    break
-
+                # Read a small chunk via slicing (no extra copy)
+                end = min(offset + CHUNK_SIZE, total)
+                chunk = raw_bytes[offset:end]
+                offset = end
                 sent += len(chunk)
-                active_streams[stream_key] = time.time()  # refresh on every chunk sent
+
+                # Refresh activity timestamp
+                active_streams[stream_key] = time.time()
                 yield chunk
 
-                # Small sleep to prevent CPU-spin and allow cooperative scheduling
+                # Yield to event loop — prevents blocking
                 await asyncio.sleep(0)
 
-            logger.info(f"✅ Stream complete — sent {sent / (1024*1024):.1f} MB")
+            logger.info(f"✅ Stream done — sent {sent / (1024*1024):.1f} MB")
 
+        except asyncio.CancelledError:
+            logger.info(f"🔌 Client disconnected — {file_id[:20]}")
         except Exception as e:
             logger.error(f"💥 Stream error: {e}")
         finally:
+            # Aggressively free memory
             active_streams.pop(stream_key, None)
+            if buffer is not None:
+                try:
+                    buffer.close()
+                except Exception:
+                    pass
+            # Delete the raw bytes buffer and force GC
+            try:
+                del raw_bytes
+            except NameError:
+                pass
+            force_gc()
+            logger.info(f"🗑️  Stream cleanup done — RAM: {get_ram_usage()['rss_mb']} MB")
 
     return StreamingResponse(
         generate(),
@@ -159,9 +243,12 @@ async def stream_video(file_id: str):
 # ---------------------------------------------------------------------------
 @app.get("/stats")
 async def stats():
+    ram = get_ram_usage()
     return {
         "active_streams": len(active_streams),
-        "stream_ids": list(active_streams.keys())[:10],  # top 10 only
+        "ram": ram,
+        "ram_ok": is_ram_ok(),
+        "stream_ids": list(active_streams.keys())[:10],
     }
 
 
